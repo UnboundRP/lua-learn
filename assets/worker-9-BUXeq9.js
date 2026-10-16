@@ -306,6 +306,7 @@ end
 
 -- ------------------------------------------------------------ events
 local handlers, netSafe, commands = {}, {}, {}
+local aceAllowed, cfgLine   -- filled in further down (ACE permissions)
 
 local function deliver(name, src, args, label)
   local list = handlers[name]
@@ -320,8 +321,13 @@ end
 
 local function chatMessage(target, msg)
   local a = type(msg) == 'table' and msg.args or nil
+  if type(msg) == 'table' and type(msg.template) == 'string' then
+    local text = msg.template:gsub('{(%d+)}', function(i) return tostring((a or {})[tonumber(i) + 1] or '') end):gsub('<[^>]+>', '')
+    out('game', '[chat' .. (target and (' → #' .. tostring(target)) or '') .. '] ' .. stripColors(text))
+    return
+  end
   if a then out('game', '[chat' .. (target and (' → #' .. tostring(target)) or '') .. '] ' .. table.concat((function()
-    local t = {} for i, v in ipairs(a) do t[i] = tostring(v) end return t end)(), ': '))
+    local t = {} for i, v in ipairs(a) do t[i] = stripColors(tostring(v)) end return t end)(), ': '))
   else out('game', '[chat] ' .. tostring(msg)) end
 end
 
@@ -395,6 +401,7 @@ api.TriggerEvent = function(name, ...)
   local args = table.pack(...)
   eventsLog[#eventsLog + 1] = { dir = 'local', name = name, args = args }
   if name == 'chat:addMessage' then chatMessage(nil, args[1]) return end
+  if name == 'chat:addSuggestion' then out('game', '[chat] suggestion added: ' .. tostring(args[1]) .. (args[2] and ('  (' .. tostring(args[2]) .. ')') or '')) return end
   out('sys', '⚡ local event "' .. tostring(name) .. '"' .. (args.n > 0 and ('  (' .. fmtArgs(args) .. ')') or ''))
   local list = handlers[name]
   if not list then out('sys', '   (nobody is listening for "' .. tostring(name) .. '")') return end
@@ -435,7 +442,6 @@ api.RegisterCommand = function(name, cb, restricted)
   out('sys', '⌨ command /' .. name .. ' registered' .. (restricted and ' (restricted: needs ACE permission)' or ''))
 end
 
-local aces = { [1] = true }  -- Tina is an admin in the fake world
 local function runCommand(pid, line)
   line = tostring(line):gsub('^%s*/', '')
   local args = {}
@@ -445,12 +451,11 @@ local function runCommand(pid, line)
   local c = commands[cname:lower()]
   out('sys', '⌨ ' .. (pid == 0 and 'console' or playerLabel(pid)) .. ' types: /' .. line)
   if not c then out('game', '[chat] Unknown command /' .. cname .. ' (it was never registered)') return end
-  if c.restricted and pid ~= 0 and not aces[pid] then out('game', '[chat] Access denied for /' .. cname .. ' (player has no permission)') return end
+  if c.restricted and pid ~= 0 and not aceAllowed(pid, 'command.' .. cname:lower()) then out('game', '[chat] Access denied for /' .. cname .. ' (player has no permission)') return end
   local src = (opts.side == 'client') and 0 or pid
   spawn(function() c.fn(src, args, line) end, 'command /' .. cname, 0, src, 'command')
 end
 api.ExecuteCommand = function(line) runCommand(opts.side == 'client' and opts.player or 0, line) end
-api.IsPlayerAceAllowed = function(pid, ace) needSide('server', 'IsPlayerAceAllowed') return aces[tonumber(pid)] == true end
 
 -- players & peds
 api.PlayerId = function() needSide('client', 'PlayerId') return 0 end
@@ -589,6 +594,605 @@ api.GetResourceKvpInt = function(k) local v = KVP[k] if math.type(v) == 'integer
 api.GetResourceKvpFloat = function(k) local v = KVP[k] if type(v) == 'number' then return v + 0.0 end return 0.0 end
 api.DeleteResourceKvp = function(k) KVP[k] = nil out('sys', '🗑 deleted KVP "' .. tostring(k) .. '"') end
 
+-- =====================================================================
+-- v2 additions: models, peds, network ids, blips, text, NUI, exports,
+-- promises, state bags, ACE permissions, convars, oxmysql-style MySQL,
+-- player connect/drop. Still all FAKE, shaped like the real thing.
+-- =====================================================================
+
+-- ------------------------------------------------------------ models
+local KNOWN_MODELS, VEHICLE_MODELS = {}, {}
+for _, m in ipairs({ 'adder', 'sultan', 'zentorno', 't20', 'faggio', 'blista', 'taxi', 'police', 'police2', 'ambulance',
+  'firetruk', 'bati', 'sanchez', 'burrito', 'mule', 'flatbed', 'towtruck', 'bus', 'tug', 'dinghy', 'buzzard', 'speedo', 'boxville' }) do
+  KNOWN_MODELS[joaat(m)] = m; VEHICLE_MODELS[joaat(m)] = true
+end
+for _, m in ipairs({ 'a_m_y_business_01', 'a_f_y_tourist_01', 's_m_y_cop_01', 's_m_m_paramedic_01', 'mp_m_freemode_01',
+  'mp_f_freemode_01', 'a_c_chop', 'g_m_y_ballasouth_01', 's_m_y_dealer_01', 'a_m_m_farmer_01' }) do KNOWN_MODELS[joaat(m)] = m end
+local function mhash(m) if type(m) == 'string' then return joaat(m) end return tonumber(m) end
+-- a 'broken' custom car: exists in the game files but never finishes loading (like a broken streamed mod)
+local NEVER_LOADS = { [joaat('tina_custom')] = true }
+KNOWN_MODELS[joaat('tina_custom')] = 'tina_custom'; VEHICLE_MODELS[joaat('tina_custom')] = true
+local requested = {}
+local MODEL_LOAD_MS = 50
+
+api.IsModelInCdimage = function(m) return KNOWN_MODELS[mhash(m) or 0] ~= nil end
+api.IsModelValid = api.IsModelInCdimage
+api.IsModelAVehicle = function(m) return VEHICLE_MODELS[mhash(m) or 0] == true end
+api.IsModelAPed = function(m) local h = mhash(m) or 0 return KNOWN_MODELS[h] ~= nil and not VEHICLE_MODELS[h] end
+api.RequestModel = function(m)
+  needSide('client', 'RequestModel')
+  native('RequestModel', table.pack(m))
+  local h = mhash(m) or 0
+  if not requested[h] then requested[h] = now end
+end
+api.HasModelLoaded = function(m)
+  needSide('client', 'HasModelLoaded')
+  local h = mhash(m) or 0
+  return KNOWN_MODELS[h] ~= nil and not NEVER_LOADS[h] and requested[h] ~= nil and now >= requested[h] + MODEL_LOAD_MS
+end
+api.SetModelAsNoLongerNeeded = function(m) native('SetModelAsNoLongerNeeded', table.pack(m)) requested[mhash(m) or 0] = nil end
+local function modelName(m) local h = mhash(m) return KNOWN_MODELS[h or 0] or tostring(m) end
+
+local function newEntity(kind, model, x, y, z, heading, isNet)
+  local id = nextEntity; nextEntity = nextEntity + 1
+  entities[id] = { kind = kind, model = mhash(model), coords = vector3(x, y, z), health = kind == 'vehicle' and 1000 or 200, armour = 0,
+    heading = heading or 0.0, networked = isNet and true or false, plate = kind == 'vehicle' and string.format('%08X', id * 7919 % 0xFFFFFFFF):sub(1, 8) or nil,
+    side = opts.side }
+  return id
+end
+local function canCreate(model, fname)
+  local h = mhash(model)
+  if not KNOWN_MODELS[h or 0] then
+    out('warn', fname .. ': model ' .. tostring(model) .. ' does not exist, nothing was spawned (returned 0). Check the name with IsModelInCdimage first.')
+    return false
+  end
+  if opts.side == 'client' and (NEVER_LOADS[h] or not (requested[h] and now >= requested[h] + MODEL_LOAD_MS)) then
+    out('warn', fname .. ': the model "' .. modelName(model) .. '" is not loaded yet, so GTA spawns nothing (returned 0). RequestModel it and wait for HasModelLoaded first.')
+    return false
+  end
+  return true
+end
+api.CreateVehicle = function(model, x, y, z, heading, isNet, mission)
+  native('CreateVehicle', table.pack(model, x, y, z, heading, isNet, mission))
+  if not canCreate(model, 'CreateVehicle') then return 0 end
+  local id = newEntity('vehicle', model, x, y, z, heading, isNet)
+  out('game', '[game] spawned vehicle ' .. modelName(model) .. ' as entity ' .. id .. ' at ' .. tostring(vector3(x, y, z)))
+  return id
+end
+api.CreateVehicleServerSetter = function(model, vtype, x, y, z, heading)
+  needSide('server', 'CreateVehicleServerSetter')
+  return api.CreateVehicle(model, x, y, z, heading, true, true)
+end
+api.CreatePed = function(pedType, model, x, y, z, heading, isNet, scriptHost)
+  native('CreatePed', table.pack(pedType, model, x, y, z, heading, isNet, scriptHost))
+  if not canCreate(model, 'CreatePed') then return 0 end
+  local id = newEntity('ped', model, x, y, z, heading, isNet)
+  out('game', '[game] spawned ped ' .. modelName(model) .. ' as entity ' .. id .. ' at ' .. tostring(vector3(x, y, z)))
+  return id
+end
+api.DeleteEntity = function(e)
+  native('DeleteEntity', table.pack(e))
+  if entities[tonumber(e) or -1] and entities[tonumber(e)].player then out('warn', 'DeleteEntity: you tried to delete a PLAYER ped. Never do that.') return end
+  entities[tonumber(e) or -1] = nil out('game', '[game] entity ' .. tostring(e) .. ' deleted')
+end
+api.DeleteVehicle = api.DeleteEntity
+api.DeletePed = api.DeleteEntity
+api.GetEntityModel = function(e) local x = ent(e) return x and x.model or 0 end
+api.GetEntityType = function(e) local x = ent(e) if not x then return 0 end return x.kind == 'ped' and 1 or x.kind == 'vehicle' and 2 or 3 end
+api.SetEntityAsMissionEntity = function(e, a, b) native('SetEntityAsMissionEntity', table.pack(e, a, b)) end
+api.SetEntityAsNoLongerNeeded = function(e) native('SetEntityAsNoLongerNeeded', table.pack(e)) end
+api.SetVehicleNumberPlateText = function(v, t) local x = ent(v) if x then x.plate = tostring(t):upper():sub(1, 8) end end
+api.GetVehicleNumberPlateText = function(v) local x = ent(v) return x and x.plate or '' end
+api.SetVehicleOnGroundProperly = function(v) native('SetVehicleOnGroundProperly', table.pack(v)) return true end
+api.SetVehicleDoorsLocked = function(v, s) native('SetVehicleDoorsLocked', table.pack(v, s)) out('game', '[game] vehicle ' .. tostring(v) .. ' lock state ' .. tostring(s)) end
+api.TaskWarpPedIntoVehicle = function(ped, veh, seat) native('TaskWarpPedIntoVehicle', table.pack(ped, veh, seat)) out('game', '[game] ped ' .. tostring(ped) .. ' warped into vehicle ' .. tostring(veh)) end
+api.SetPedIntoVehicle = function(ped, veh, seat) native('SetPedIntoVehicle', table.pack(ped, veh, seat)) out('game', '[game] ped ' .. tostring(ped) .. ' put into vehicle ' .. tostring(veh)) end
+api.FreezeEntityPosition = function(e, f) native('FreezeEntityPosition', table.pack(e, f)) end
+api.SetEntityInvincible = function(e, f) native('SetEntityInvincible', table.pack(e, f)) end
+api.SetBlockingOfNonTemporaryEvents = function(e, f) native('SetBlockingOfNonTemporaryEvents', table.pack(e, f)) end
+api.GetAllVehicles = function()
+  needSide('server', 'GetAllVehicles')
+  local t = {} for id, e in pairs(entities) do if e.kind == 'vehicle' then t[#t + 1] = id end end
+  table.sort(t) return t
+end
+api.GetAllPeds = function()
+  needSide('server', 'GetAllPeds')
+  local t = {} for id, e in pairs(entities) do if e.kind == 'ped' then t[#t + 1] = id end end
+  table.sort(t) return t
+end
+local NET_OFFSET = 70000
+api.NetworkGetNetworkIdFromEntity = function(e) if not ent(e) then return 0 end return (tonumber(e) or 0) + NET_OFFSET end
+api.NetworkGetEntityFromNetworkId = function(n) local e = (tonumber(n) or 0) - NET_OFFSET if ent(e) then return e end return 0 end
+api.NetToVeh, api.NetToPed, api.VehToNet, api.PedToNet = api.NetworkGetEntityFromNetworkId, api.NetworkGetEntityFromNetworkId,
+  api.NetworkGetNetworkIdFromEntity, api.NetworkGetNetworkIdFromEntity
+api.NetworkDoesNetworkIdExist = function(n) return api.NetworkGetEntityFromNetworkId(n) ~= 0 end
+api.NetworkGetEntityOwner = function(e) local x = ent(e) if not x then return -1 end return x.player or 1 end
+
+-- ------------------------------------------------------------ blips & text
+local blips, nextBlip = {}, 5001
+local function newBlip(coords, entity)
+  needSide('client', 'AddBlipFor...')
+  local id = nextBlip; nextBlip = nextBlip + 1
+  blips[id] = { id = id, coords = coords, entity = entity, sprite = 1, colour = 0, scale = 1.0, shortRange = false, name = nil }
+  native('AddBlip', table.pack(id))
+  out('game', '[map] blip ' .. id .. ' added' .. (entity and (' on entity ' .. tostring(entity)) or (' at ' .. tostring(coords))))
+  return id
+end
+local function blipSet(field, name) return function(b, v) needSide('client', name) native(name, table.pack(b, v)) local x = blips[tonumber(b) or -1] if x then x[field] = v end end end
+api.AddBlipForCoord = function(x, y, z) return newBlip(vector3(x, y, z), nil) end
+api.AddBlipForEntity = function(e) return newBlip(nil, e) end
+api.AddBlipForRadius = function(x, y, z, r) local b = newBlip(vector3(x, y, z), nil) blips[b].radius = r return b end
+api.SetBlipSprite, api.SetBlipColour, api.SetBlipScale = blipSet('sprite', 'SetBlipSprite'), blipSet('colour', 'SetBlipColour'), blipSet('scale', 'SetBlipScale')
+api.SetBlipAsShortRange, api.SetBlipDisplay, api.SetBlipRoute = blipSet('shortRange', 'SetBlipAsShortRange'), blipSet('display', 'SetBlipDisplay'), blipSet('route', 'SetBlipRoute')
+api.SetBlipAlpha = blipSet('alpha', 'SetBlipAlpha')
+api.DoesBlipExist = function(b) return blips[tonumber(b) or -1] ~= nil end
+api.RemoveBlip = function(b) needSide('client', 'RemoveBlip') if blips[tonumber(b) or -1] then blips[tonumber(b)] = nil out('game', '[map] blip ' .. tostring(b) .. ' removed') end end
+api.SetNewWaypoint = function(x, y) needSide('client', 'SetNewWaypoint') out('game', string.format('[map] waypoint set to %.1f, %.1f', x, y)) end
+local pendingKind = nil
+api.BeginTextCommandSetBlipName = function() needSide('client', 'BeginTextCommandSetBlipName') pendingText = '' end
+api.EndTextCommandSetBlipName = function(b) local x = blips[tonumber(b) or -1] if x then x.name = pendingText end end
+api.BeginTextCommandDisplayText = function() needSide('client', 'BeginTextCommandDisplayText') pendingText = '' end
+api.EndTextCommandDisplayText = function(x, y) native('DrawText', table.pack(pendingText, x, y)) end
+for _, n in ipairs({ 'SetTextFont', 'SetTextScale', 'SetTextColour', 'SetTextCentre', 'SetTextOutline', 'SetTextProportional',
+  'SetTextDropShadow', 'SetTextEntry', 'SetDrawOrigin', 'ClearDrawOrigin', 'DrawRect', 'DrawLightWithRange' }) do
+  api[n] = function(...) needSide('client', n) native(n, table.pack(...)) end
+end
+api.GetScreenCoordFromWorldCoord = function(x, y, z) needSide('client', 'GetScreenCoordFromWorldCoord') return true, 0.5, 0.5 end
+
+-- ------------------------------------------------------------ NUI
+local nuiCallbacks, nuiMessages, nuiFocus = {}, {}, { false, false }
+api.SendNUIMessage = function(t)
+  needSide('client', 'SendNUIMessage')
+  if type(t) ~= 'table' then error('SendNUIMessage needs a table, e.g. SendNUIMessage({ action = "open" })', 2) end
+  nuiMessages[#nuiMessages + 1] = t
+  out('sys', '🖥 Lua → NUI page: ' .. json.encode(t))
+end
+api.RegisterNUICallback = function(name, fn)
+  needSide('client', 'RegisterNUICallback')
+  if type(fn) ~= 'function' then error('RegisterNUICallback("' .. tostring(name) .. '", function(data, cb) ... end) needs a function', 2) end
+  nuiCallbacks[name] = fn
+end
+api.SetNuiFocus = function(a, b)
+  needSide('client', 'SetNuiFocus')
+  nuiFocus = { a and true or false, b and true or false }
+  out('game', '[nui] focus: keyboard=' .. tostring(nuiFocus[1]) .. ', mouse=' .. tostring(nuiFocus[2]))
+end
+api.IsNuiFocused = function() return nuiFocus[1] or nuiFocus[2] end
+
+-- ------------------------------------------------------------ exports
+local exportsReg = {}
+local otherBank = { [1] = 2500, [2] = 800, [3] = 0 }
+local fakeResources = {
+  practice_bank = {
+    GetMoney = function(src) return otherBank[tonumber(src) or -1] or 0 end,
+    AddMoney = function(src, amount)
+      src = tonumber(src); amount = tonumber(amount)
+      if not src or not otherBank[src] or not amount or amount <= 0 then return false end
+      otherBank[src] = otherBank[src] + amount
+      out('game', '[practice_bank] +' .. amount .. ' for ' .. playerLabel(src) .. ' (now ' .. otherBank[src] .. ')') return true
+    end,
+    RemoveMoney = function(src, amount)
+      src = tonumber(src); amount = tonumber(amount)
+      if not src or not otherBank[src] or not amount or amount <= 0 or otherBank[src] < amount then return false end
+      otherBank[src] = otherBank[src] - amount
+      out('game', '[practice_bank] -' .. amount .. ' for ' .. playerLabel(src) .. ' (now ' .. otherBank[src] .. ')') return true
+    end,
+  },
+  ['practice-notify'] = {
+    Notify = function(text, kind) out('game', '[notify' .. (kind and (':' .. tostring(kind)) or '') .. '] ' .. tostring(text)) return true end,
+  },
+}
+local function resourceProxy(res)
+  local proxy = {}
+  return setmetatable(proxy, { __index = function(_, fname)
+    local reg = res == 'my_first_resource' and exportsReg or fakeResources[res]
+    if not reg then error('No such resource "' .. tostring(res) .. '" (is it started? check the name and ensure it in server.cfg)', 2) end
+    local fn = reg[fname]
+    if not fn then error('No such export ' .. tostring(fname) .. ' in resource ' .. tostring(res), 2) end
+    return function(self, ...)
+      if self ~= proxy then
+        out('warn', 'exports.' .. res .. '.' .. tostring(fname) .. '(...) was called with a DOT. Use a COLON: exports.' .. res .. ':' .. tostring(fname) ..
+          '(...). With a dot, your first value is swallowed and the export gets the wrong arguments.')
+      end
+      return fn(...)
+    end
+  end })
+end
+local proxies = {}
+api.exports = setmetatable({}, {
+  __call = function(_, name, fn)
+    if type(name) ~= 'string' or type(fn) ~= 'function' then error('exports("name", function(...) ... end) needs a name and a function', 2) end
+    exportsReg[name] = fn
+    out('sys', '📤 export "' .. name .. '" registered (other resources call exports.my_first_resource:' .. name .. '(...))')
+  end,
+  __index = function(_, res) proxies[res] = proxies[res] or resourceProxy(res) return proxies[res] end,
+})
+api.GetResourceState = function(res)
+  if res == 'my_first_resource' or fakeResources[res] then return 'started' end
+  return 'missing'
+end
+api.GetNumResources = function() return 3 end
+
+-- ------------------------------------------------------------ promises
+local promise = {}
+promise.__index = promise
+function promise.new() return setmetatable({ state = 'pending' }, promise) end
+function promise:resolve(v) if self.state == 'pending' then self.state = 'resolved' self.value = v end end
+function promise:reject(e) if self.state == 'pending' then self.state = 'rejected' self.value = e end end
+api.promise = { new = promise.new }
+api.Citizen.Await = function(p)
+  if type(p) ~= 'table' or not p.state then error('Citizen.Await needs a promise (promise.new())', 2) end
+  if not current then error('Citizen.Await can only be used inside a thread, event or command handler.', 2) end
+  local started = now
+  while p.state == 'pending' do
+    coroutine.yield(16)
+    if now - started > 30000 then error('Citizen.Await: the promise was never resolved (waited 30 s). Did the other side ever answer?', 2) end
+  end
+  if p.state == 'rejected' then error(p.value, 2) end
+  return p.value
+end
+
+-- ------------------------------------------------------------ state bags
+local bags, bagHandlers, nextBagHandler = {}, {}, 0
+local function fireBag(bagName, key, value, replicated)
+  for _, h in pairs(bagHandlers) do
+    if (h.key == nil or h.key == '' or h.key == key) and (h.bag == nil or h.bag == '' or h.bag == bagName) then
+      spawn(function() h.fn(bagName, key, value, 0, replicated) end, 'state bag handler (' .. key .. ')', 0, nil, 'event')
+    end
+  end
+end
+local function stateFor(bagName, kind)
+  bags[bagName] = bags[bagName] or {}
+  local values = bags[bagName]
+  local st = {}
+  local function set(key, value, replicated)
+    if opts.side == 'client' and kind == 'global' then
+      out('warn', 'Clients cannot change GlobalState. Only the server can (nothing changed).') return
+    end
+    if opts.side == 'client' and replicated then
+      out('warn', 'A CLIENT just set replicated state "' .. tostring(key) .. '" on ' .. bagName .. '. Clients can do this for their own player/entities, so the server must never trust it for money, jobs or permissions.')
+    end
+    values[key] = value
+    out('sys', '🏷 state ' .. bagName .. ' .' .. tostring(key) .. ' = ' .. (type(value) == 'table' and json.encode(value) or fmtValue(value)) .. (replicated and '' or '  (not replicated)'))
+    fireBag(bagName, key, value, replicated)
+  end
+  st.set = function(self, key, value, replicated)
+    if self ~= st then error('Use a colon: state:set("key", value, true)', 2) end
+    set(key, value, replicated and true or false)
+  end
+  return setmetatable(st, { __index = function(_, k) return values[k] end,
+    __newindex = function(_, k, v) set(k, v, opts.side ~= 'client' or kind ~= 'global') end })
+end
+api.GlobalState = stateFor('global', 'global')
+api.LocalPlayer = setmetatable({}, { __index = function(_, k) if k == 'state' then return stateFor('player:' .. tostring(opts.player), 'player') end end })
+api.Player = function(id)
+  local n = tonumber(id)
+  if not n then error('Player(id) needs a server id (number or numeric string)', 2) end
+  return { state = stateFor('player:' .. n, 'player') }
+end
+api.Entity = function(e)
+  local n = tonumber(e)
+  if not n or not entities[n] then error('Entity(handle): entity ' .. tostring(e) .. ' does not exist', 2) end
+  if entities[n].player then return { state = stateFor('player:' .. entities[n].player, 'player') } end
+  return { state = stateFor('entity:' .. (n + NET_OFFSET), 'entity') }
+end
+api.AddStateBagChangeHandler = function(key, bag, fn)
+  if type(fn) ~= 'function' then error('AddStateBagChangeHandler(key, bagName, function(bagName, key, value) ... end) needs a function', 2) end
+  nextBagHandler = nextBagHandler + 1
+  bagHandlers[nextBagHandler] = { key = key, bag = bag, fn = fn }
+  return nextBagHandler
+end
+api.RemoveStateBagChangeHandler = function(h) bagHandlers[h] = nil end
+api.GetPlayerFromStateBagName = function(name) local n = tostring(name):match('^player:(%d+)$') return tonumber(n) or 0 end
+api.GetEntityFromStateBagName = function(name) local n = tostring(name):match('^entity:(%d+)$') if not n then return 0 end return api.NetworkGetEntityFromNetworkId(tonumber(n)) end
+
+-- ------------------------------------------------------------ ACE permissions
+local aceRules, principalParents = {}, {}
+local function addAce(principal, ace, mode) aceRules[principal] = aceRules[principal] or {} aceRules[principal][ace] = (mode ~= 'deny') end
+local function addPrincipal(child, parent) principalParents[child] = principalParents[child] or {} principalParents[child][parent] = true end
+addAce('group.admin', 'command', 'allow'); addAce('group.admin', 'admin', 'allow')
+addAce('group.police', 'police', 'allow'); addAce('group.police', 'command.cuff', 'allow')
+addPrincipal('group.admin', 'group.police')
+addPrincipal('identifier.license:1a2b3c4d5e', 'group.admin')
+addPrincipal('identifier.license:9f8e7d6c5b', 'group.police')
+local function principalsOf(pid)
+  local list, seen = {}, {}
+  local function add(p) if seen[p] then return end seen[p] = true list[#list + 1] = p for parent in pairs(principalParents[p] or {}) do add(parent) end end
+  add('player.' .. tostring(pid))
+  local pl = players[tonumber(pid) or -999]
+  if pl then for _, idv in ipairs(pl.ids) do add('identifier.' .. idv) end end
+  add('builtin.everyone')
+  return list
+end
+aceAllowed = function(pid, ace)
+  if tonumber(pid) == 0 then return true end
+  ace = tostring(ace)
+  local verdict = nil
+  for _, p in ipairs(principalsOf(pid)) do
+    local rules = aceRules[p]
+    if rules then
+      -- most specific rule wins: "command.x" beats "command"; a deny anywhere at the same level wins
+      local probe = ace
+      while probe do
+        if rules[probe] ~= nil then
+          if rules[probe] == false then return false end
+          verdict = verdict or true
+          break
+        end
+        probe = probe:match('^(.*)%.[^.]*$')
+      end
+    end
+  end
+  return verdict == true
+end
+api.IsPlayerAceAllowed = function(pid, ace) needSide('server', 'IsPlayerAceAllowed') return aceAllowed(pid, ace) end
+api.IsPrincipalAceAllowed = function(p, ace) needSide('server', 'IsPrincipalAceAllowed') local r = aceRules[p] return r ~= nil and r[ace] == true end
+cfgLine = function(line)
+  local w = {} for x in line:gmatch('%S+') do w[#w + 1] = x end
+  if w[1] == 'add_ace' and w[4] then addAce(w[2], w[3], w[4]) out('sys', '⚙ server.cfg: ' .. line) return true end
+  if w[1] == 'remove_ace' and w[3] then if aceRules[w[2]] then aceRules[w[2]][w[3]] = nil end out('sys', '⚙ server.cfg: ' .. line) return true end
+  if w[1] == 'add_principal' and w[3] then addPrincipal(w[2], w[3]) out('sys', '⚙ server.cfg: ' .. line) return true end
+  if w[1] == 'remove_principal' and w[3] then if principalParents[w[2]] then principalParents[w[2]][w[3]] = nil end out('sys', '⚙ server.cfg: ' .. line) return true end
+  return false
+end
+
+-- ------------------------------------------------------------ convars
+local convars = { sv_hostname = 'Lua for Los Santos (practice)', sv_maxclients = '48', locale = 'en-GB', my_debug = 'false' }
+api.GetConvar = function(name, default) local v = convars[name] if v == nil then return default end return v end
+api.GetConvarInt = function(name, default) return math.tointeger(tonumber(convars[name])) or default end
+api.SetConvar = function(name, v) needSide('server', 'SetConvar') convars[name] = tostring(v) end
+api.SetConvarReplicated = api.SetConvar
+
+-- ------------------------------------------------------------ identifiers (0-based by index, like the real natives)
+api.GetNumPlayerIdentifiers = function(id) needSide('server', 'GetNumPlayerIdentifiers') local p = players[tonumber(id) or -999] return p and #p.ids or 0 end
+api.GetPlayerIdentifier = function(id, i) needSide('server', 'GetPlayerIdentifier') local p = players[tonumber(id) or -999] return p and p.ids[(tonumber(i) or 0) + 1] or nil end
+api.GetPlayerEndpoint = function(id) needSide('server', 'GetPlayerEndpoint') return '127.0.0.' .. tostring(id) end
+api.GetPlayerTokens = function(id) needSide('server', 'GetPlayerTokens') return { '2:' .. tostring(id) .. 'abc' } end
+
+-- ------------------------------------------------------------ fake oxmysql
+local db = {
+  users = {
+    { id = 1, identifier = 'license:1a2b3c4d5e', name = 'Tina', money = 500, bank = 2500, job = 'mechanic' },
+    { id = 2, identifier = 'license:9f8e7d6c5b', name = 'Bob', money = 200, bank = 800, job = 'police' },
+    { id = 3, identifier = 'license:0badc0ffee', name = 'Sneaky_Steve', money = 50, bank = 0, job = 'unemployed' },
+  },
+  owned_vehicles = {
+    { id = 1, owner = 'license:1a2b3c4d5e', plate = 'TINA 01', model = 'sultan', stored = 1 },
+  },
+  bans = {
+    { id = 1, identifier = 'license:0badc0ffee', reason = 'money exploit' },
+  },
+}
+local dbIds = { users = 3, owned_vehicles = 1, bans = 1 }
+local queryLog = {}
+local function sqlTokens(sql)
+  local toks, i = {}, 1
+  while i <= #sql do
+    local c = sql:sub(i, i)
+    if c:match('%s') then i = i + 1
+    elseif c == "'" or c == '"' then
+      local j = i + 1 local buf = {}
+      while j <= #sql do
+        local d = sql:sub(j, j)
+        if d == c and sql:sub(j + 1, j + 1) == c then buf[#buf + 1] = c j = j + 2
+        elseif d == c then break
+        else buf[#buf + 1] = d j = j + 1 end
+      end
+      toks[#toks + 1] = { t = 'str', v = table.concat(buf) } i = j + 1
+    elseif c:match('%d') or (c == '-' and sql:sub(i + 1, i + 1):match('%d') and (not toks[#toks] or toks[#toks].t == 'sym' or toks[#toks].t == 'kw')) then
+      local n = sql:match('^-?%d+%.?%d*', i) toks[#toks + 1] = { t = 'num', v = tonumber(n) } i = i + #n
+    elseif c:match('[%a_\`]') then
+      local w = sql:match('^\`?[%w_]+\`?', i) i = i + #w
+      w = w:gsub('\`', '')
+      local up = w:upper()
+      if ({ SELECT = 1, FROM = 1, WHERE = 1, AND = 1, OR = 1, INSERT = 1, INTO = 1, VALUES = 1, UPDATE = 1, SET = 1, DELETE = 1,
+        ORDER = 1, BY = 1, ASC = 1, DESC = 1, LIMIT = 1, COUNT = 1, NULL = 1 })[up] then toks[#toks + 1] = { t = 'kw', v = up }
+      else toks[#toks + 1] = { t = 'id', v = w } end
+    elseif c == '?' then toks[#toks + 1] = { t = 'param' } i = i + 1
+    elseif c == '@' or c == ':' then local w = sql:match('^[@:][%w_]+', i) toks[#toks + 1] = { t = 'named', v = w:sub(2) } i = i + #w
+    else
+      local two = sql:sub(i, i + 1)
+      if two == '<=' or two == '>=' or two == '!=' or two == '<>' then toks[#toks + 1] = { t = 'sym', v = two } i = i + 2
+      else toks[#toks + 1] = { t = 'sym', v = c } i = i + 1 end
+    end
+  end
+  return toks
+end
+local function runSql(sql, params)
+  params = params or {}
+  if type(sql) ~= 'string' then error('MySQL: the query must be a string', 3) end
+  local toks = sqlTokens(sql:gsub(';%s*$', ''))
+  local pos, pi = 1, 0
+  local function peek(o) return toks[pos + (o or 0)] end
+  local function nextTok() pos = pos + 1 return toks[pos - 1] end
+  local function isKw(v) local t = peek() return t and t.t == 'kw' and t.v == v end
+  local function isSym(v) local t = peek() return t and t.t == 'sym' and t.v == v end
+  local function expect(kind, v)
+    local t = nextTok()
+    if not t or (kind == 'kw' and (t.t ~= 'kw' or t.v ~= v)) or (kind == 'sym' and (t.t ~= 'sym' or t.v ~= v)) or (kind == 'id' and t.t ~= 'id') then
+      error('MySQL syntax error near "' .. (t and tostring(t.v) or 'end of query') .. '" (expected ' .. (v or kind) .. ')', 0)
+    end
+    return t
+  end
+  local function value()
+    local t = nextTok()
+    if not t then error('MySQL syntax error: query ended too early', 0) end
+    if t.t == 'param' then pi = pi + 1 local v = params[pi] return function() return v end end
+    if t.t == 'named' then local v = params[t.v] if v == nil then v = params['@' .. t.v] end return function() return v end end
+    if t.t == 'str' or t.t == 'num' then return function() return t.v end end
+    if t.t == 'kw' and t.v == 'NULL' then return function() return nil end end
+    if t.t == 'id' then
+      local col = t.v
+      if isSym('+') or isSym('-') then
+        local op = nextTok().v local rhs = value()
+        return function(row) local a, b = tonumber(row[col]) or 0, tonumber(rhs(row)) or 0 return op == '+' and a + b or a - b end
+      end
+      return function(row) return row[col] end
+    end
+    error('MySQL syntax error near "' .. tostring(t.v) .. '"', 0)
+  end
+  local function cond()
+    local ors = {}
+    repeat
+      local ands = {}
+      repeat
+        local l = value()
+        local op = nextTok()
+        if not op or op.t ~= 'sym' then error('MySQL syntax error: expected a comparison like col = ?', 0) end
+        local r = value()
+        ands[#ands + 1] = function(row)
+          local a, b = l(row), r(row)
+          if type(a) == 'number' and type(b) == 'string' then b = tonumber(b) or b end
+          if type(b) == 'number' and type(a) == 'string' then a = tonumber(a) or a end
+          if op.v == '=' then return a == b elseif op.v == '!=' or op.v == '<>' then return a ~= b end
+          if type(a) ~= type(b) or a == nil then return false end
+          if op.v == '<' then return a < b elseif op.v == '>' then return a > b elseif op.v == '<=' then return a <= b elseif op.v == '>=' then return a >= b end
+          error('MySQL: unknown comparison ' .. op.v, 0)
+        end
+      until not (isKw('AND') and nextTok())
+      ors[#ors + 1] = ands
+    until not (isKw('OR') and nextTok())
+    return function(row)
+      for _, ands in ipairs(ors) do
+        local all = true
+        for _, f in ipairs(ands) do if not f(row) then all = false break end end
+        if all then return true end
+      end
+      return false
+    end
+  end
+  local function tableRows(name) if not db[name] then error('MySQL: table "' .. tostring(name) .. "\\" doesn't exist", 0) end return db[name] end
+  local function copyRow(r, cols) local c = {} if cols then for _, k in ipairs(cols) do c[k] = r[k] end else for k, v in pairs(r) do c[k] = v end end return c end
+  local first = nextTok()
+  if not first then error('MySQL: empty query', 0) end
+  if first.v == 'SELECT' then
+    local cols, count = {}, false
+    if isSym('*') then nextTok() cols = nil
+    elseif isKw('COUNT') then nextTok() expect('sym', '(') nextTok() expect('sym', ')') count = true
+    else repeat cols[#cols + 1] = expect('id').v until not (isSym(',') and nextTok()) end
+    expect('kw', 'FROM')
+    local rows = tableRows(expect('id').v)
+    local where = isKw('WHERE') and nextTok() and cond() or nil
+    local result = {}
+    for _, r in ipairs(rows) do if not where or where(r) then result[#result + 1] = r end end
+    if isKw('ORDER') then
+      nextTok() expect('kw', 'BY') local col = expect('id').v local desc = false
+      if isKw('DESC') then nextTok() desc = true elseif isKw('ASC') then nextTok() end
+      table.sort(result, function(a, b) if desc then return (a[col] or 0) > (b[col] or 0) end return (a[col] or 0) < (b[col] or 0) end)
+    end
+    if isKw('LIMIT') then nextTok() local lt = nextTok() local n = lt.t == 'param' and (function() pi = pi + 1 return tonumber(params[pi]) end)() or tonumber(lt.v) or 0 local t = {} for i = 1, math.min(n, #result) do t[i] = result[i] end result = t end
+    if count then return { { ['COUNT(*)'] = #result } }, 'select' end
+    local outRows = {} for i, r in ipairs(result) do outRows[i] = copyRow(r, cols) end
+    return outRows, 'select'
+  elseif first.v == 'INSERT' then
+    expect('kw', 'INTO')
+    local name = expect('id').v
+    if not db[name] then db[name] = {} dbIds[name] = 0 end
+    expect('sym', '(')
+    local cols = {} repeat cols[#cols + 1] = expect('id').v until not (isSym(',') and nextTok())
+    expect('sym', ')') expect('kw', 'VALUES') expect('sym', '(')
+    local vals = {} repeat vals[#vals + 1] = value() until not (isSym(',') and nextTok())
+    expect('sym', ')')
+    if #vals ~= #cols then error('MySQL: ' .. #cols .. ' columns but ' .. #vals .. ' values', 0) end
+    dbIds[name] = (dbIds[name] or 0) + 1
+    local row = { id = dbIds[name] }
+    for i, c in ipairs(cols) do row[c] = vals[i]({}) end
+    table.insert(db[name], row)
+    return { insertId = row.id, affectedRows = 1 }, 'insert'
+  elseif first.v == 'UPDATE' then
+    local rows = tableRows(expect('id').v)
+    expect('kw', 'SET')
+    local sets = {} repeat local c = expect('id').v expect('sym', '=') sets[#sets + 1] = { c, value() } until not (isSym(',') and nextTok())
+    local where = isKw('WHERE') and nextTok() and cond() or nil
+    if not where then out('warn', 'UPDATE without WHERE changes EVERY row in the table. That is almost never what you want.') end
+    local n = 0
+    for _, r in ipairs(rows) do
+      if not where or where(r) then
+        local newVals = {} for i, s in ipairs(sets) do newVals[i] = s[2](r) end
+        for i, s in ipairs(sets) do r[s[1]] = newVals[i] end
+        n = n + 1
+      end
+    end
+    return { affectedRows = n, changedRows = n }, 'update'
+  elseif first.v == 'DELETE' then
+    expect('kw', 'FROM')
+    local rows = tableRows(expect('id').v)
+    local where = isKw('WHERE') and nextTok() and cond() or nil
+    if not where then out('warn', 'DELETE without WHERE deletes EVERY row in the table!') end
+    local n = 0
+    for i = #rows, 1, -1 do if not where or where(rows[i]) then table.remove(rows, i) n = n + 1 end end
+    return { affectedRows = n }, 'delete'
+  end
+  error('MySQL: this practice database understands SELECT, INSERT, UPDATE and DELETE only', 0)
+end
+local function sqlCall(kind, sql, params, level)
+  needSide('server', 'MySQL.' .. kind)
+  if params ~= nil and type(params) ~= 'table' then error('MySQL.' .. kind .. ': the parameters must be a table, e.g. { identifier }', level) end
+  queryLog[#queryLog + 1] = { sql = sql, params = params, kind = kind, t = now }
+  local shown = (#queryLog <= 40)
+  if shown then out('sys', '🗄 SQL: ' .. tostring(sql) .. (params and #params > 0 and ('   ← ' .. fmtArgs(table.pack(table.unpack(params)))) or '')) end
+  if #queryLog == 41 then out('warn', 'More than 40 database queries in one run. A real server would feel this. Cache data in Lua tables and save less often.') end
+  if type(sql) == 'string' and (sql:find("'", 1, true) or sql:find('"', 1, true)) then
+    out('warn', 'This SQL has a value written straight into the text (quotes). If any part came from a player, that is SQL INJECTION. Use ? placeholders and pass the values in the parameters table.')
+  end
+  local ok, res, what = pcall(runSql, sql, params)
+  if not ok then error(res, level) end
+  if kind == 'single' then return what == 'select' and res[1] or nil end
+  if kind == 'scalar' then local r = what == 'select' and res[1] if not r then return nil end local _, v = next(r) return v end
+  if kind == 'insert' then return what == 'insert' and res.insertId or nil end
+  if kind == 'update' then return res.affectedRows end
+  return res
+end
+local function sqlFn(kind)
+  return setmetatable({
+    await = function(sql, params)
+      if not current then error('MySQL.' .. kind .. '.await must run inside a thread, event handler or command (it pauses while the database answers).', 2) end
+      local r = sqlCall(kind, sql, params, 3)
+      coroutine.yield(5)   -- the database takes a moment to answer
+      return r
+    end,
+  }, { __call = function(_, sql, params, cb)
+    if type(params) == 'function' then cb, params = params, nil end
+    local r = sqlCall(kind, sql, params, 3)
+    if cb then spawn(function() cb(r) end, 'MySQL callback', 5, lastSource, 'event') end
+  end })
+end
+api.MySQL = { query = sqlFn('query'), single = sqlFn('single'), scalar = sqlFn('scalar'), insert = sqlFn('insert'),
+  update = sqlFn('update'), prepare = sqlFn('query') }
+
+-- ------------------------------------------------------------ connect / drop
+local connectResult = nil
+local function connectPlayer(pid)
+  local p = players[pid]
+  if not p then return end
+  connectResult = { pid = pid, state = 'connecting', messages = {} }
+  local deferrals = {
+    defer = function() connectResult.deferred = true end,
+    update = function(msg) connectResult.messages[#connectResult.messages + 1] = tostring(msg) out('game', '[connecting screen] ' .. tostring(msg)) end,
+    presentCard = function() end,
+    done = function(reason)
+      if connectResult.state ~= 'connecting' then return end
+      if reason and reason ~= '' then connectResult.state = 'rejected' connectResult.reason = tostring(reason) out('game', '[server] ' .. p.name .. ' was refused: ' .. tostring(reason))
+      else connectResult.state = 'accepted' out('game', '[server] ' .. p.name .. ' joined the server') end
+    end,
+    handover = function() end,
+  }
+  local function setKickReason(r) connectResult.kick = tostring(r) end
+  out('sys', '🔌 ' .. playerLabel(pid) .. ' is connecting...')
+  deliver('playerConnecting', pid, table.pack(p.name, setKickReason, deferrals), 'local')
+end
+local function dropPlayer(pid, reason)
+  local p = players[pid]
+  if not p then return end
+  out('sys', '🔌 ' .. playerLabel(pid) .. ' left the server (' .. tostring(reason or 'Exiting') .. ')')
+  deliver('playerDropped', pid, table.pack(reason or 'Exiting'), 'local')
+end
+
+api.ExecuteCommand = function(line)
+  if opts.side ~= 'client' and cfgLine(tostring(line)) then return end
+  runCommand(opts.side == 'client' and opts.player or 0, line)
+end
+
 api.vector3, api.vec3, api.vector4, api.vec4, api.vector2, api.vec2 = vector3, vector3, vector4, vector4, vector2, vector2
 api.json = json
 
@@ -616,7 +1220,10 @@ local function makeEnv()
   for _, k in ipairs(safe) do e[k] = _G[k] end
   local function copy(t) local c = {} for k, v in pairs(t) do c[k] = v end return c end
   e.string, e.table, e.math, e.utf8 = copy(string), copy(table), copy(math), copy(utf8)
-  e.os = { time = os.time, date = os.date, clock = function() return now / 1000 end }
+  if opts.side ~= 'client' then
+    e.os = { time = os.time, date = os.date, difftime = os.difftime, clock = function() return now / 1000 end }
+  end   -- like real FiveM: the os library does not exist in CLIENT scripts
+  e.debug = { traceback = debug.traceback }
   local co = copy(coroutine)
   co.create = function(fn)
     local c = coroutine.create(function(...)
@@ -637,8 +1244,9 @@ local function makeEnv()
   e.coroutine = co
   for k, v in pairs(api) do e[k] = v end
   if opts.side == 'manifest' then
-    for _, w in ipairs({ 'fx_version', 'game', 'author', 'description', 'version', 'lua54', 'ui_page', 'name' }) do e[w] = mf(w) end
-    for _, w in ipairs({ 'games', 'client_scripts', 'server_scripts', 'shared_scripts', 'files', 'dependencies' }) do e[w] = mf(w) end
+    for _, w in ipairs({ 'fx_version', 'game', 'author', 'description', 'version', 'lua54', 'ui_page', 'name', 'loadscreen', 'this_is_a_map', 'node_version', 'use_experimental_fxv2_oal' }) do e[w] = mf(w) end
+    for _, w in ipairs({ 'games', 'client_scripts', 'server_scripts', 'shared_scripts', 'files', 'dependencies', 'escrow_ignore', 'provides' }) do e[w] = mf(w) end
+    e.provide = mf('provides', true)
     e.client_script, e.server_script, e.shared_script, e.file, e.dependency =
       mf('client_scripts', true), mf('server_scripts', true), mf('shared_scripts', true), mf('files', true), mf('dependencies', true)
   end
@@ -722,6 +1330,26 @@ local function testHelpers(e)
   e.__kvp = function(k) return KVP[k] end
   e.__globals = function() return globalsCreated end
   e.__manifest = function() return manifest end
+  e.__blips = function() local t = {} for _, b in pairs(blips) do local c = {} for k, v in pairs(b) do c[k] = v end t[#t + 1] = c end table.sort(t, function(a, b) return a.id < b.id end) return t end
+  e.__nui = function(name, data)
+    local fn = nuiCallbacks[name]
+    out('sys', '🧪 checker: the NUI page calls "' .. tostring(name) .. '"  ' .. json.encode(data or {}))
+    if not fn then out('warn', 'No RegisterNUICallback("' .. tostring(name) .. '", ...) exists, so the page gets no answer.') return nil, false end
+    local reply, answered = nil, false
+    fn(data or {}, function(r) reply = r answered = true end)
+    if not answered then out('warn', 'The NUI callback "' .. tostring(name) .. '" never called cb(...). The page will wait forever: always call cb, even with cb("ok").') end
+    return reply, answered
+  end
+  e.__nuiMessages = function() return nuiMessages end
+  e.__nuiFocus = function() return nuiFocus[1], nuiFocus[2] end
+  e.__connect = function(pid) connectPlayer(pid) api.Wait(100) return connectResult end
+  e.__drop = function(pid, reason) dropPlayer(pid, reason) end
+  e.__queries = function() return queryLog end
+  e.__db = function(name) return db[name] end
+  e.__bank = function(pid) return otherBank[pid] end
+  e.__entities = function(kind) local t = {} for id, x in pairs(entities) do if not kind or x.kind == kind then t[#t + 1] = { id = id, kind = x.kind, model = x.model, coords = x.coords, plate = x.plate, player = x.player } end end table.sort(t, function(a, b) return a.id < b.id end) return t end
+  e.__state = function(bag, key) return (bags[bag] or {})[key] end
+  e.__ace = function(pid, ace) return aceAllowed(pid, ace) end
 end
 
 -- ------------------------------------------------------------ entry points
