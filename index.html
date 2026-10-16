@@ -12,8 +12,8 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Lua LS">
-  <script type="module" crossorigin src="./assets/index-D4CRS1mj.js"></script>
-  <link rel="stylesheet" crossorigin href="./assets/index-LWBRJAHV.css">
+  <script type="module" crossorigin src="./assets/index-C8ZndW7X.js"></script>
+  <link rel="stylesheet" crossorigin href="./assets/index-qBgR8brr.css">
 </head>
 <body>
   <header class="topbar">
@@ -24,8 +24,9 @@
       <a href="#/ref" data-nav="ref">Reference</a>
       <a href="#/account" data-nav="account">Account</a>
     </nav>
-    <a href="#/account" class="sync-dot local" id="syncDot" title="Saved on this device"></a>
+    <a href="#/account" class="sync-pill syncing" id="syncDot" title="Connecting…"><span class="dot"></span><span class="lbl">Connecting…</span></a>
   </header>
+  <div id="syncBanner" class="banner-wrap" hidden></div>
   <main id="view"><p style="padding:2rem">Loading…</p></main>
   <nav class="bottomnav">
     <a href="#/" data-nav="lessons"><span>📖</span>Lessons</a>
