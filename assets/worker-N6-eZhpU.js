@@ -17,8 +17,10 @@ local printed = {}
 local eventsLog, nativesLog, checks, globalsCreated = {}, {}, {}, {}
 local opts = { side = 'shared', duration = 5000, seed = nil, player = 1 }
 
+local gameLines = {}
 local function out(kind, text)
   if kind == 'out' then printed[#printed + 1] = text end
+  if kind == 'game' then gameLines[#gameLines + 1] = text end
   if kind == 'err' then emit(kind, text) return end
   lineCount = lineCount + 1
   if lineCount < OUT_LIMIT then
@@ -230,10 +232,14 @@ local function hookFor(t)
   end
 end
 
+-- which player's computer is running this client code? In whole-resource mode every
+-- player has their own client, so a command typed by Bob runs on Bob's client.
+local function me() return (R.resourceMode and current and current.player) or opts.player end
 local function spawn(fn, name, delay, src, kind)
   nextId = nextId + 1
   local t = { id = nextId, name = name or ('thread #' .. nextId), wake = now + (delay or 0), wakes = 0, wait0 = 0,
               waits = 0, count = 0, source = src, started = false, kind = kind or 'thread', alive = true }
+  if R.resourceMode then t.side = opts.side t.player = current and current.player end
   t.co = coroutine.create(function()
     debug.sethook(hookFor(t), '', HOOK_STEP)
     return fn()
@@ -271,7 +277,9 @@ local function runScheduler(untilTime, mainThread)
       best.started = true
       if best.source ~= nil then lastSource = best.source end
     end
-    rawset(env, 'source', lastSource)
+    if best.side then opts.side = best.side end
+    if env then rawset(env, 'source', lastSource) end
+    if R.envs then for _, e2 in pairs(R.envs) do rawset(e2, 'source', lastSource) end end
     local ok, res = coroutine.resume(best.co)
     current = nil
     if not ok then
@@ -301,21 +309,29 @@ end
 
 local function native(name, args, side)
   if side then needSide(side, name) end
-  nativesLog[#nativesLog + 1] = { name = name, args = args }
+  nativesLog[#nativesLog + 1] = { name = name, args = args, t = now }
+  -- natives that only last one frame: a Wait(0) round that called one is doing real per-frame work
+  if current and (name == 'SetSuperJumpThisFrame' or name == 'DrawMarker' or name == 'DisableControlAction' or name == 'DrawRect') then current.frameWork = true end
 end
 
 -- ------------------------------------------------------------ events
 local handlers, netSafe, commands = {}, {}, {}
 local aceAllowed, cfgLine   -- filled in further down (ACE permissions)
 
-local function deliver(name, src, args, label)
+local function deliver(name, src, args, label, toSide)
   local list = handlers[name]
+  if list and toSide and R.resourceMode then
+    local f = {}
+    for _, h in ipairs(list) do if h.side == toSide or h.side == 'shared' or h.side == nil then f[#f + 1] = h end end
+    list = f
+  end
   if not list or #list == 0 then
     out('sys', '   (nobody is listening for "' .. name .. '", so nothing happens)')
     return
   end
   for _, h in ipairs(list) do
-    spawn(function() h.fn(table.unpack(args, 1, args.n)) end, 'event "' .. name .. '"', label == 'net' and 30 or 0, src, 'event')
+    local th = spawn(function() h.fn(table.unpack(args, 1, args.n)) end, 'event "' .. name .. '"', label == 'net' and 30 or 0, src, 'event')
+    if R.resourceMode and h.side then th.side = h.side end
   end
 end
 
@@ -351,7 +367,11 @@ api.Wait = function(ms)
   if not t then error('Wait() can only be used inside a thread (Citizen.CreateThread) or an event/command handler.', 2) end
   ms = tonumber(ms) or 0
   t.waits = t.waits + 1
-  if ms <= 0 then t.wait0 = t.wait0 + 1 end
+  if ms <= 0 then
+    t.wait0 = t.wait0 + 1
+    if not t.frameWork then t.idle0 = (t.idle0 or 0) + 1 end
+  end
+  t.frameWork = false
   coroutine.yield(ms)
 end
 
@@ -387,7 +407,7 @@ api.AddEventHandler = function(name, cb)
   if type(name) ~= 'string' then error('AddEventHandler needs the event name (a string) first', 2) end
   if type(cb) ~= 'function' then error('AddEventHandler("' .. name .. '", ...) needs a function as the 2nd value', 2) end
   handlers[name] = handlers[name] or {}
-  local h = { name = name, fn = cb }
+  local h = { name = name, fn = cb, side = opts.side }
   table.insert(handlers[name], h)
   return h
 end
@@ -406,21 +426,25 @@ api.TriggerEvent = function(name, ...)
   local list = handlers[name]
   if not list then out('sys', '   (nobody is listening for "' .. tostring(name) .. '")') return end
   for _, h in ipairs(list) do
+    if R.resourceMode and h.side ~= opts.side then goto continue end
+    do
     local ok, e = pcall(h.fn, ...)
     if not ok then reportError(e, { name = 'event "' .. name .. '"', kind = 'event' }) end
+    end
+    ::continue::
   end
 end
 
 api.TriggerServerEvent = function(name, ...)
   needSide('client', 'TriggerServerEvent')
   local args = table.pack(...)
-  eventsLog[#eventsLog + 1] = { dir = 'toServer', name = name, args = args, from = opts.player }
+  eventsLog[#eventsLog + 1] = { dir = 'toServer', name = name, args = args, from = me() }
   out('sys', '📡 client → server: "' .. tostring(name) .. '"' .. (args.n > 0 and ('  (' .. fmtArgs(args) .. ')') or ''))
   if handlers[name] and not netSafe[name] then
     out('warn', 'The server has a handler for "' .. name .. '" but it was never registered with RegisterNetEvent, so the real server would IGNORE this event from a client.')
     return
   end
-  deliver(name, opts.player, args, 'net')
+  deliver(name, me(), args, 'net', 'server')
 end
 
 api.TriggerClientEvent = function(name, target, ...)
@@ -431,39 +455,92 @@ api.TriggerClientEvent = function(name, target, ...)
   if name == 'chat:addMessage' then chatMessage(target, args[1]) return end
   out('sys', '📡 server → client ' .. (tonumber(target) == -1 and 'EVERYONE (-1)' or playerLabel(target)) .. ': "' .. tostring(name) .. '"' ..
     (args.n > 0 and ('  (' .. fmtArgs(args) .. ')') or ''))
-  if opts.side == 'shared' and handlers[name] and netSafe[name] then deliver(name, nil, args, 'net') end
+  if (opts.side == 'shared' or R.resourceMode) and handlers[name] and netSafe[name] then deliver(name, nil, args, 'net', 'client') end
 end
 
 api.RegisterCommand = function(name, cb, restricted)
   if type(name) ~= 'string' then error('RegisterCommand needs the command name as a string (without the /)', 2) end
   if type(cb) ~= 'function' then error('RegisterCommand("' .. name .. '", ...) needs a function as the 2nd value', 2) end
   if name:sub(1, 1) == '/' then out('warn', 'Command names are written WITHOUT the slash: RegisterCommand("' .. name:sub(2) .. '", ...)') end
-  commands[name:lower()] = { fn = cb, restricted = restricted and true or false, name = name }
+  commands[name:lower()] = { fn = cb, restricted = restricted and true or false, name = name, side = opts.side }
   out('sys', '⌨ command /' .. name .. ' registered' .. (restricted and ' (restricted: needs ACE permission)' or ''))
 end
 
-local function runCommand(pid, line)
+local pressKey
+local function runCommand(pid, line, via)
   line = tostring(line):gsub('^%s*/', '')
   local args = {}
   for w in line:gmatch('%S+') do args[#args + 1] = w end
   local cname = table.remove(args, 1)
   if not cname then return end
   local c = commands[cname:lower()]
-  out('sys', '⌨ ' .. (pid == 0 and 'console' or playerLabel(pid)) .. ' types: /' .. line)
-  if not c then out('game', '[chat] Unknown command /' .. cname .. ' (it was never registered)') return end
-  if c.restricted and pid ~= 0 and not aceAllowed(pid, 'command.' .. cname:lower()) then out('game', '[chat] Access denied for /' .. cname .. ' (player has no permission)') return end
-  local src = (opts.side == 'client') and 0 or pid
-  spawn(function() c.fn(src, args, line) end, 'command /' .. cname, 0, src, 'command')
+  if not c and not via and (cname:lower() == 'key' or cname:lower() == 'press') then pressKey(pid, args[1]) return end
+  out('sys', '⌨ ' .. (pid == 0 and 'console' or playerLabel(pid)) .. (via or ' types: /') .. line)
+  if not c then out('game', '[chat] Unknown command /' .. cname .. ' (it was never registered' .. (via and ' with RegisterCommand, so the key does nothing' or '') .. ')') return end
+  if c.restricted and pid ~= 0 and (c.side or opts.side) ~= 'client' and not aceAllowed(pid, 'command.' .. cname:lower()) then out('game', '[chat] Access denied for /' .. cname .. ' (player has no permission)') return end
+  local src = ((c.side or opts.side) == 'client') and 0 or pid
+  local th = spawn(function() c.fn(src, args, line) end, 'command /' .. cname, 0, src, 'command')
+  if c.side and R.resourceMode then th.side = c.side if c.side == 'client' then th.player = pid end end
 end
-api.ExecuteCommand = function(line) runCommand(opts.side == 'client' and opts.player or 0, line) end
+
+-- RegisterKeyMapping: binds a default key to a COMMAND. Players can rebind it (Settings > Key Bindings > FiveM).
+local keyMappings = {}
+api.RegisterKeyMapping = function(command, description, mapper, key)
+  needSide('client', 'RegisterKeyMapping')
+  if type(command) ~= 'string' then error('RegisterKeyMapping needs the command name first, as a string without the slash, e.g. RegisterKeyMapping("superjump", "Toggle super jump", "keyboard", "J")', 2) end
+  if command:sub(1, 1) == '/' then out('warn', 'Key mappings use the command name WITHOUT the slash: RegisterKeyMapping("' .. command:sub(2) .. '", ...)') command = command:sub(2) end
+  if type(description) ~= 'string' then error('RegisterKeyMapping("' .. command .. '", description, "keyboard", "J"): the 2nd value is the description players see in Settings, as a string', 2) end
+  if type(mapper) ~= 'string' or type(key) ~= 'string' then error('RegisterKeyMapping("' .. command .. '", "' .. description .. '", "keyboard", "J"): the 3rd and 4th values are the input type ("keyboard") and the default key ("J"), both strings', 2) end
+  local k = key:upper()
+  keyMappings[k] = { command = command, description = description, mapper = mapper:lower(), key = k }
+  native('RegisterKeyMapping', table.pack(command, description, mapper, key))
+  out('sys', '🎹 key ' .. k .. ' → /' .. command .. '  ("' .. description .. '", players can change it in Settings → Key Bindings → FiveM)')
+end
+local jumpingUntil = -1
+pressKey = function(pid, key)
+  local k = tostring(key or ''):upper()
+  local m = keyMappings[k]
+  if not m and (k == 'SPACE' or k == 'JUMP') then
+    -- the built-in jump key: the ped is "jumping" for a short moment
+    out('sys', '🎹 ' .. playerLabel(pid) .. ' presses SPACE (jump)')
+    jumpingUntil = now + 800
+    native('Jump', table.pack(pid))
+    return true
+  end
+  if not m then out('sys', '🎹 ' .. playerLabel(pid) .. ' presses ' .. k .. '  (no RegisterKeyMapping uses this key, so nothing happens)') return false end
+  if m.command:sub(1, 1) == '+' then
+    runCommand(pid, m.command, ' presses ' .. k .. ' → /')
+    spawn(function() api.Wait(150) runCommand(pid, '-' .. m.command:sub(2), ' releases ' .. k .. ' → /') end, 'key release ' .. k, 0, nil, 'event')
+  else
+    runCommand(pid, m.command, ' presses ' .. k .. ' → /')
+  end
+  return true
+end
+api.SetSuperJumpThisFrame = function(player)
+  needSide('client', 'SetSuperJumpThisFrame')
+  if player == nil then error('SetSuperJumpThisFrame(player) needs the player INDEX, usually PlayerId()', 2) end
+  local last = nil
+  for i = #nativesLog, 1, -1 do if nativesLog[i].name == 'SetSuperJumpThisFrame' then last = nativesLog[i].t break end end
+  native('SetSuperJumpThisFrame', table.pack(player))
+  if not last or now - last > 100 then out('game', '[game] 🦘 super jump active (lasts one frame; keep calling it every frame)') end
+end
+api.SetPedCanRagdoll = function(ped, v) native('SetPedCanRagdoll', table.pack(ped, v), 'client') end
+api.IsPedJumping = function(ped) needSide('client', 'IsPedJumping') return now < jumpingUntil end
+api.ApplyForceToEntity = function(entity, forceType, x, y, z, ...)
+  needSide('client', 'ApplyForceToEntity')
+  if type(entity) ~= 'number' then error('ApplyForceToEntity(entity, forceType, x, y, z, ...) needs an entity handle first, e.g. PlayerPedId()', 2) end
+  native('ApplyForceToEntity', table.pack(entity, forceType, x, y, z, ...))
+  out('game', ('[game] 💨 push on entity %s: x %.1f, y %.1f, z %.1f'):format(tostring(entity), tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0))
+end
+api.ExecuteCommand = function(line) runCommand(opts.side == 'client' and me() or 0, line) end
 
 -- players & peds
 api.PlayerId = function() needSide('client', 'PlayerId') return 0 end
-api.GetPlayerServerId = function(idx) needSide('client', 'GetPlayerServerId') if tonumber(idx) == 0 or tonumber(idx) == -1 then return opts.player end return tonumber(idx) or 0 end
-api.PlayerPedId = function() needSide('client', 'PlayerPedId') return players[opts.player].ped end
+api.GetPlayerServerId = function(idx) needSide('client', 'GetPlayerServerId') if tonumber(idx) == 0 or tonumber(idx) == -1 then return me() end return tonumber(idx) or 0 end
+api.PlayerPedId = function() needSide('client', 'PlayerPedId') return players[me()].ped end
 api.GetPlayerName = function(id)
   local n = tonumber(id)
-  if opts.side == 'client' and (n == 0 or n == -1) then n = opts.player end
+  if opts.side == 'client' and (n == 0 or n == -1) then n = me() end
   local p = players[n or -999]
   return p and p.name or nil
 end
@@ -477,7 +554,7 @@ end
 api.GetNumPlayerIndices = function() needSide('server', 'GetNumPlayerIndices') return 3 end
 api.GetPlayerPed = function(id)
   local n = tonumber(id)
-  if opts.side ~= 'server' and (n == -1 or n == 0) then n = opts.player end
+  if opts.side ~= 'server' and (n == -1 or n == 0) then n = me() end
   local p = players[n or -999]
   return p and p.ped or 0
 end
@@ -1266,6 +1343,7 @@ local function makeEnv()
 end
 
 -- ------------------------------------------------------------ test helpers
+local resourceInfo -- filled in by whole-resource mode (declared here so the helpers can see it)
 local function testHelpers(e)
   e.__check = function(cond, msg) checks[#checks + 1] = { ok = cond and true or false, msg = tostring(msg) } return cond end
   e.__printed = function(sub)
@@ -1350,6 +1428,141 @@ local function testHelpers(e)
   e.__entities = function(kind) local t = {} for id, x in pairs(entities) do if not kind or x.kind == kind then t[#t + 1] = { id = id, kind = x.kind, model = x.model, coords = x.coords, plate = x.plate, player = x.player } end end table.sort(t, function(a, b) return a.id < b.id end) return t end
   e.__state = function(bag, key) return (bags[bag] or {})[key] end
   e.__ace = function(pid, ace) return aceAllowed(pid, ace) end
+  e.__pressKey = function(key, pid) return pressKey(pid or opts.player, key) end
+  e.__keyMappings = function() local t = {} for k, m in pairs(keyMappings) do t[k] = { command = m.command, description = m.description, mapper = m.mapper, key = m.key } end return t end
+  e.__resource = function() return resourceInfo end
+  e.__commandSide = function(name) local c = commands[name:lower()] return c and c.side or nil end
+  e.__wait = function(ms) api.Wait(ms) end
+  -- what the PLAYER saw: chat lines, notifications, help boxes, [game] effects
+  e.__game = function(sub) for _, l in ipairs(gameLines) do if l:find(sub, 1, true) then return true end end return false end
+  e.__gameLines = function() local t = {} for i, v in ipairs(gameLines) do t[i] = v end return t end
+end
+
+-- ------------------------------------------------------------ whole-resource mode
+-- The code holds several files, each starting with a line like   -- ===== client.lua =====
+-- fxmanifest.lua decides which files run on which side, like a real FiveM server:
+-- shared_scripts load on both sides first, then server_scripts on the server, client_scripts on the client.
+-- Server and client get SEPARATE globals (two different computers); events travel between them.
+resourceInfo = { files = {}, order = {}, loaded = {}, missing = {}, unlisted = {}, manifest = manifest }
+local function splitFiles(code)
+  local files, order, stray = {}, {}, false
+  local cur, n = nil, 0
+  for line in (code .. '\\n'):gmatch('(.-)\\n') do
+    n = n + 1
+    local name = line:match('^%-%-%s*=+%s*([%w_%-%./]+)%s*=+%s*$')
+    if name then
+      cur = { name = name, startLine = n + 1, lines = {} }
+      if files[name:lower()] then out('warn', 'The file ' .. name .. ' appears twice; only the last one is used.') end
+      files[name:lower()] = cur
+      order[#order + 1] = cur
+    elseif cur then cur.lines[#cur.lines + 1] = line
+    elseif line:match('%S') and not line:match('^%s*%-%-') then stray = true end
+  end
+  if stray then out('warn', 'Some code is above the first   -- ===== name.lua =====   line, so it belongs to no file and never runs.') end
+  return files, order
+end
+local function globMatch(pattern, name)
+  local pat = '^' .. pattern:lower():gsub('[%.%-%+%%%(%)%[%]%^%$%?]', '%%%0'):gsub('%*%*/', '\\1'):gsub('%*', '[^/]*'):gsub('\\1', '.-') .. '$'
+  return name:lower():match(pat) ~= nil
+end
+local function runResource(code, testCode)
+  R.resourceMode = true
+  local files, order = splitFiles(code)
+  resourceInfo.files, resourceInfo.order = files, order
+  local mfFile = files['fxmanifest.lua']
+  local envs = {}
+  R.envs = envs
+  local testEnv
+  local main = spawn(function()
+    if not mfFile then
+      out('err', 'This resource has no fxmanifest.lua (add a line   -- ===== fxmanifest.lua =====   and the manifest below it). Without it FiveM does not know this folder is a resource, so nothing starts.')
+    else
+      opts.side = 'manifest'
+      local menv = makeEnv()
+      local fn, err = load(string.rep('\\n', mfFile.startLine - 1) .. table.concat(mfFile.lines, '\\n'), '=fxmanifest.lua', 't', menv)
+      if not fn then out('err', err) else
+        local ok, e = pcall(fn)
+        if not ok then out('err', tostring(e)) end
+      end
+      if not manifest.fx_version then out('err', 'fxmanifest.lua has no fx_version line (e.g.  fx_version \\'cerulean\\'). FiveM refuses to start a resource without it.') end
+      if not manifest.game and not manifest.games then out('warn', 'fxmanifest.lua has no game line (e.g.  game \\'gta5\\'). Add it so FiveM knows which game this is for.') end
+      -- which files run where
+      local used = { ['fxmanifest.lua'] = true }
+      local plan = {}
+      local function addList(list, side)
+        for _, pat in ipairs(list or {}) do
+          if type(pat) == 'string' and pat:match('^@') then
+            out('sys', '   (' .. pat .. ' comes from another resource; the practice world skips it)')
+          else
+            local found = false
+            for _, f in ipairs(order) do
+              if globMatch(tostring(pat), f.name) then found = true used[f.name:lower()] = true plan[#plan + 1] = { file = f, side = side } end
+            end
+            if not found then
+              resourceInfo.missing[#resourceInfo.missing + 1] = tostring(pat)
+              out('err', 'fxmanifest.lua lists "' .. tostring(pat) .. '" (' .. side .. ') but there is no file with that name. Check the spelling, the folder and the .lua ending.')
+            end
+          end
+        end
+      end
+      -- server first (it starts when the resource starts), then the client (when a player joins)
+      addList(manifest.shared_scripts, 'server') addList(manifest.server_scripts, 'server')
+      local sharedClient = {}
+      for _, pat in ipairs(manifest.shared_scripts or {}) do sharedClient[#sharedClient + 1] = pat end
+      local nMissing = #resourceInfo.missing
+      addList(sharedClient, 'client') addList(manifest.client_scripts, 'client')
+      for i = #resourceInfo.missing, nMissing + 1, -1 do
+        -- shared files are reported only once
+        local pat = resourceInfo.missing[i]
+        for _, x in ipairs(manifest.shared_scripts or {}) do if x == pat then table.remove(resourceInfo.missing, i) break end end
+      end
+      for _, f in ipairs(order) do
+        if not used[f.name:lower()] and f.name:lower():match('%.lua$') then
+          resourceInfo.unlisted[#resourceInfo.unlisted + 1] = f.name
+          out('warn', f.name .. ' is in the resource but fxmanifest.lua does not list it, so FiveM never runs it.')
+        end
+      end
+      for _, sideName in ipairs({ 'server', 'client' }) do
+        opts.side = sideName
+        envs[sideName] = makeEnv()
+      end
+      env = envs.server
+      for _, step in ipairs(plan) do
+        opts.side = step.side
+        current.side = step.side
+        local e = envs[step.side]
+        local f = step.file
+        resourceInfo.loaded[#resourceInfo.loaded + 1] = { file = f.name, side = step.side }
+        out('sys', '📄 ' .. step.side .. ' loads ' .. f.name)
+        local chunk, err = load(string.rep('\\n', f.startLine - 1) .. table.concat(f.lines, '\\n'), '=' .. f.name, 't', e)
+        if not chunk then out('err', err) else
+          local ok, e2 = pcall(chunk)
+          if not ok then out('err', '[' .. f.name .. ' on the ' .. step.side .. '] ' .. tostring(e2)) end
+        end
+      end
+      out('sys', '▶ resource started (' .. #plan .. ' file load' .. (#plan == 1 and '' or 's') .. ')')
+    end
+    opts.side = 'shared'
+    current.side = 'shared'
+    if testCode and testCode ~= '' then
+      testEnv = makeEnv()
+      testHelpers(testEnv)
+      testEnv.__client, testEnv.__server = envs.client or {}, envs.server or {}
+      local fn, err = load(testCode, '=checker', 't', testEnv)
+      if not fn then out('err', 'checker: ' .. err) else
+        local ok, e = pcall(fn)
+        if not ok then out('err', 'checker: ' .. tostring(e)) end
+      end
+    end
+  end, 'your resource', 0, nil, 'main')
+  main.side = 'shared'
+  runScheduler(opts.duration or 5000, main)
+  local busy = {}
+  for _, th in ipairs(allThreads) do
+    if (th.kind == 'thread' or th.kind == 'timeout') and (th.idle0 or 0) >= 60 then busy[#busy + 1] = { name = th.name, wait0 = th.idle0 } end
+  end
+  local userLines = select(2, code:gsub('\\n', '\\n')) + 1
+  return { userLines = userLines, busy = busy, alive = #threads, simTime = now, globals = {}, checks = checks, mainFailed = R.mainFailed, resource = true }
 end
 
 -- ------------------------------------------------------------ entry points
@@ -1357,6 +1570,7 @@ function R.run(code, testCode, o)
   for k, v in pairs(o or {}) do opts[k] = v end
   if type(opts.kvp) == 'string' then KVP = json.decode(opts.kvp) or {} end
   if opts.seed then math.randomseed(opts.seed) end
+  if opts.side == 'resource' then return runResource(code, testCode) end
   env = makeEnv()
   testHelpers(env)
   local userLines = select(2, code:gsub('\\n', '\\n')) + 1
@@ -1374,8 +1588,8 @@ function R.run(code, testCode, o)
   -- report
   local busy = {}
   for _, th in ipairs(allThreads) do
-    if (th.kind == 'thread' or th.kind == 'timeout') and th.wait0 >= 60 then
-      busy[#busy + 1] = { name = th.name, wait0 = th.wait0 }
+    if (th.kind == 'thread' or th.kind == 'timeout') and (th.idle0 or 0) >= 60 then
+      busy[#busy + 1] = { name = th.name, wait0 = th.idle0 }
     end
   end
   local alive = 0
